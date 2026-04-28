@@ -21,6 +21,7 @@ from .providers import (
     ProviderResult,
     RevAI,
     Speechmatics,
+    SubQ,
     Wordcab,
     WordcabHosted,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "RevAIOptions",
     "Speechmatics",
     "SpeechmaticsOptions",
+    "SubQ",
     "Wordcab",
     "WordcabOptions",
     "WordcabHosted",

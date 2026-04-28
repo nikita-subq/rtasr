@@ -196,6 +196,25 @@ PROVIDERS = OrderedDict(
             },
         ),
         (
+            "subq",
+            {
+                "url": "https://stt-api.staging.aldea.ai/v1/listen",
+                "engine": "SubQ",
+                "output": "DeepgramOutput",
+                "speaker_map": "DeepgramSpeakerMap",
+                "concurrency_limit": 5,
+                "options": {
+                    "diarize": True,
+                    "punctuate": True,
+                    "utterances": True,
+                },
+                "pricing": {
+                    "value": 0.0,
+                    "unit": "minute",
+                },
+            },
+        ),
+        (
             "wordcab",
             {
                 "url": "https://wordcab.com/api/v1",

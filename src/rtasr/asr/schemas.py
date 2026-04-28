@@ -61,13 +61,25 @@ class AzureOutput(ASROutput):
 
 
 class DeepgramWords(BaseModel):
-    """Deepgram words schema."""
+    """Deepgram words schema.
 
-    confidence: float
+    The optional fields below are populated by the Deepgram API but are not
+    always returned by Deepgram-compatible providers (e.g. SubQ returns only
+    ``word``, ``start``, ``end``, ``speaker``). Marking them optional lets the
+    same schema parse both responses without raising ``ValidationError``.
+
+    ``speaker`` defaults to ``0`` because some providers (notably SubQ when
+    diarization is disabled or unavailable for a given request) omit the
+    field entirely on individual words. Treating those words as belonging
+    to a single speaker keeps downstream merging, RTTM emission, and
+    speaker-offset arithmetic well-defined without raising.
+    """
+
+    confidence: Union[float, None] = None
     end: float
-    punctuated_word: str
-    speaker: int
-    speaker_confidence: float
+    punctuated_word: Union[str, None] = None
+    speaker: int = 0
+    speaker_confidence: Union[float, None] = None
     start: float
     word: str
 
@@ -108,7 +120,7 @@ class DeepgramUtterance(BaseModel):
     end: float
     id: str
     start: float
-    speaker: int
+    speaker: int = 0
     transcript: str
     words: List[DeepgramWords]
 
@@ -117,7 +129,7 @@ class DeepgramResult(BaseModel):
     """Deepgram result schema."""
 
     channels: List[DeepgramChannel]
-    utterances: List[DeepgramUtterance]
+    utterances: Union[List[DeepgramUtterance], None] = None
 
 
 class DeepgramOutput(ASROutput):

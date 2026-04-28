@@ -1,6 +1,7 @@
 """Providers are the classes that actually do the API calls to the different ASR services."""
 
 import asyncio
+import io
 import json
 import traceback
 from abc import ABC, abstractmethod
@@ -33,8 +34,12 @@ from rtasr.asr.schemas import (
     AssemblyAIWord,
     AwsOutput,
     AzureOutput,
+    DeepgramAlternative,
+    DeepgramChannel,
     DeepgramOutput,
+    DeepgramResult,
     DeepgramUtterance,
+    DeepgramWords,
     GoogleOutput,
     RevAIElement,
     RevAIMonologue,
@@ -48,6 +53,20 @@ from rtasr.asr.schemas import (
 )
 from rtasr.concurrency import ConcurrencyHandler, ConcurrencyToken
 from rtasr.utils import build_query_string
+
+
+def _debug_log(debug: bool, provider_name: str, message: str) -> None:
+    """Print a tagged debug message when ``debug`` is enabled.
+
+    Centralized so every provider/debug line uses the same prefix and is easy
+    to grep in long logs (e.g. ``rtasr ... --debug 2>&1 | grep DEBUG``).
+    """
+    if debug:
+        from rich import print as rich_print
+
+        rich_print(
+            rf"[bold magenta]\[DEBUG][/bold magenta] [{provider_name}] {message}"
+        )
 
 
 class GatewayTimeoutError(Exception):
@@ -170,11 +189,26 @@ class ASRProvider(ABC):
                 the number of files that were successfully transcribed and the number
                 of files that failed to be transcribed.
         """
+        _debug_log(
+            debug,
+            self.provider_name,
+            f"launch() called. splits={list(audio_files.keys())}, "
+            f"file_counts={ {k: len(v) for k, v in audio_files.items()} }, "
+            f"output_dir={output_dir}, use_cache={use_cache}, "
+            f"data_range={data_range}, api_url={self.config.api_url}",
+        )
+
         if debug:
             audio_files = {
                 split_name: audio_files[split_name][0:1]
                 for split_name in audio_files.keys()
             }
+            _debug_log(
+                debug,
+                self.provider_name,
+                "Debug-mode slicing applied: keeping only the first audio file "
+                f"per split. New file_counts={ {k: len(v) for k, v in audio_files.items()} }",
+            )
         elif data_range:
             start, end = data_range.split(":")
             start, end = int(start), int(end)
@@ -185,8 +219,23 @@ class ASRProvider(ABC):
 
         task_tracking: Dict[str, Any] = {}
 
+        # ``tasks`` must accumulate across splits: previously this list was
+        # reassigned at every iteration, which meant every split's coroutines
+        # except the last one were silently dropped (RuntimeWarning:
+        # "coroutine 'ASRProvider._launch' was never awaited") and only the
+        # last split was actually awaited by ``as_completed`` below.
+        tasks: List[Callable] = []
+        step_progress_task_ids: Dict[str, Any] = {}
+        step_progress_totals: Dict[str, int] = {}
+
         for split_name, split_audio_files in audio_files.items():
-            tasks: List[Callable] = []
+            split_task_count_before = len(tasks)
+            _debug_log(
+                debug,
+                self.provider_name,
+                f"Preparing tasks for split='{split_name}' "
+                f"({len(split_audio_files)} audio file(s)).",
+            )
             for audio_file in split_audio_files:
                 task_tracking[audio_file.name] = {
                     "audio_file_name": audio_file.name,
@@ -204,6 +253,15 @@ class ASRProvider(ABC):
                     dialogue_file_exists,
                 ) = _check_cache_task
 
+                _debug_log(
+                    debug,
+                    self.provider_name,
+                    f"[{split_name}] cache check for '{audio_file.name}': "
+                    f"asr_output_exists={asr_output_exists}, "
+                    f"rttm_file_exists={rttm_file_exists}, "
+                    f"dialogue_file_exists={dialogue_file_exists}",
+                )
+
                 if use_cache and asr_output_exists:
                     task_tracking[audio_file.name]["asr_output_cache"] = True
 
@@ -214,10 +272,22 @@ class ASRProvider(ABC):
                                 output_dir=output_dir / split_name,
                             )
                         )
+                        _debug_log(
+                            debug,
+                            self.provider_name,
+                            f"[{split_name}] '{audio_file.name}' -> queued "
+                            "_get_asr_output_from_cache (rttm/dialogue missing).",
+                        )
                     else:
                         task_tracking[audio_file.name][
                             "status"
                         ] = TranscriptionStatus.CACHED
+                        _debug_log(
+                            debug,
+                            self.provider_name,
+                            f"[{split_name}] '{audio_file.name}' -> fully cached, "
+                            "skipping API call.",
+                        )
 
                     task_tracking[audio_file.name]["rttm_cache"] = rttm_file_exists
                     task_tracking[audio_file.name][
@@ -233,22 +303,51 @@ class ASRProvider(ABC):
                             audio_file=audio_file,
                             url=self.config.api_url,
                             session=session,
+                            debug=debug,
                         )
                     )
+                    _debug_log(
+                        debug,
+                        self.provider_name,
+                        f"[{split_name}] '{audio_file.name}' -> queued _launch "
+                        "(will hit the API).",
+                    )
 
-            step_progress_task_id = step_progress.add_task(
+            split_task_count = len(tasks) - split_task_count_before
+            _debug_log(
+                debug,
+                self.provider_name,
+                f"[{split_name}] {split_task_count} task(s) queued for execution"
+                f" (running total: {len(tasks)}).",
+            )
+
+            step_progress_task_ids[split_name] = step_progress.add_task(
                 "",
                 action=(
                     f"[bold yellow][ {split_name} ][/bold yellow]"
                     f" [bold green]{self.__class__.__name__}[/bold green]"
                 ),
-                total=len(tasks),
+                total=split_task_count,
             )
+            step_progress_totals[split_name] = split_task_count
+
+        _debug_log(
+            debug,
+            self.provider_name,
+            f"Awaiting {len(tasks)} task(s) across "
+            f"{len(step_progress_task_ids)} split(s) via asyncio.as_completed...",
+        )
 
         try:
             for future in asyncio.as_completed(tasks):
                 task_result = await future
                 audio_file_name, status, asr_output = task_result
+                _debug_log(
+                    debug,
+                    self.provider_name,
+                    f"Task completed: '{audio_file_name}' status={status} "
+                    f"output_type={type(asr_output).__name__}",
+                )
 
                 if (
                     status == TranscriptionStatus.CACHED
@@ -287,7 +386,10 @@ class ASRProvider(ABC):
                     if isinstance(asr_output, Exception):
                         task_tracking[audio_file_name]["error"] = str(asr_output)
 
-                step_progress.advance(step_progress_task_id)
+                _split_for_progress = task_tracking[audio_file_name]["split"]
+                _step_id = step_progress_task_ids.get(_split_for_progress)
+                if _step_id is not None:
+                    step_progress.advance(_step_id)
 
         except Exception as e:
             print(
@@ -301,7 +403,12 @@ class ASRProvider(ABC):
                         "status"
                     ] = TranscriptionStatus.FAILED
 
-        step_progress.update(step_progress_task_id, advance=len(tasks))
+        # Force-complete every per-split progress bar in case some tasks
+        # failed/were skipped before reaching ``step_progress.advance`` above.
+        for _split_name, _sid in step_progress_task_ids.items():
+            step_progress.update(
+                _sid, completed=step_progress_totals[_split_name]
+            )
         split_progress.advance(split_progress_task_id)
 
         status_counts = Counter(task["status"] for task in task_tracking.values())
@@ -323,22 +430,45 @@ class ASRProvider(ABC):
         audio_file: Path,
         url: HttpUrl,
         session: aiohttp.ClientSession,
+        debug: bool = False,
         **kwargs,
     ) -> Tuple[str, TranscriptionStatus, ASROutput]:
         """Run the ASR provider."""
         retries = 0
+        concurr_token: Union[ConcurrencyToken, None] = None
+
+        _debug_log(
+            debug,
+            self.provider_name,
+            f"_launch() entering for '{audio_file.name}' (max_retries="
+            f"{self.max_retries}). Waiting for concurrency token...",
+        )
 
         while retries < self.max_retries:
             try:
-                concurr_token: ConcurrencyToken = await self.concurrency_handler.get()
+                concurr_token = await self.concurrency_handler.get()
+                _debug_log(
+                    debug,
+                    self.provider_name,
+                    f"Got concurrency token for '{audio_file.name}'. "
+                    f"Calling get_transcription() (attempt {retries + 1}/"
+                    f"{self.max_retries})...",
+                )
 
                 results = await self.get_transcription(
                     audio_file=audio_file,
                     url=url,
                     session=session,
+                    debug=debug,
                     **kwargs,
                 )
                 status, asr_output = results
+                _debug_log(
+                    debug,
+                    self.provider_name,
+                    f"get_transcription() returned for '{audio_file.name}': "
+                    f"status={status}",
+                )
 
                 retries = self.max_retries  # To break the while loop
 
@@ -348,6 +478,12 @@ class ASRProvider(ABC):
                 GatewayTimeoutError,
             ) as e:
                 retries += 1
+                _debug_log(
+                    debug,
+                    self.provider_name,
+                    f"Retryable error for '{audio_file.name}' "
+                    f"(retry {retries}/{self.max_retries}): {type(e).__name__}: {e}",
+                )
                 if retries >= self.max_retries:
                     status = TranscriptionStatus.FAILED
                     asr_output = Exception(f"{e}\n{traceback.format_exc()}")
@@ -359,12 +495,20 @@ class ASRProvider(ABC):
                     await asyncio.sleep(1)
 
             except Exception as e:
+                _debug_log(
+                    debug,
+                    self.provider_name,
+                    f"Non-retryable exception for '{audio_file.name}': "
+                    f"{type(e).__name__}: {e}\n{traceback.format_exc()}",
+                )
                 status = TranscriptionStatus.FAILED
                 asr_output = Exception(f"{e}\n{traceback.format_exc()}")
                 break
 
             finally:
-                self.concurrency_handler.put(concurr_token)
+                if concurr_token is not None:
+                    self.concurrency_handler.put(concurr_token)
+                    concurr_token = None
 
         return audio_file.name, status, asr_output
 
@@ -546,6 +690,7 @@ class ASRProvider(ABC):
         audio_file: Path,
         url: HttpUrl,
         session: aiohttp.ClientSession,
+        debug: bool = False,
     ) -> Tuple[TranscriptionStatus, ASROutput]:
         """Make API calls to the ASR provider and return the result."""
         raise NotImplementedError(
@@ -590,6 +735,7 @@ class AssemblyAI(ASRProvider):
         audio_file: Path,
         url: HttpUrl,
         session: aiohttp.ClientSession,
+        debug: bool = False,
     ) -> Tuple[TranscriptionStatus, Union[AssemblyAIOutput, Exception]]:
         """Call the API of the AssemblyAI ASR provider."""
         headers = {
@@ -705,6 +851,7 @@ class Aws(ASRProvider):
         audio_file: Path,
         url: HttpUrl,
         session: aiohttp.ClientSession,
+        debug: bool = False,
     ) -> Tuple[TranscriptionStatus, AwsOutput]:
         """Call the API of the AWS ASR provider."""
         raise NotImplementedError("Aws not implemented.")
@@ -741,6 +888,7 @@ class Azure(ASRProvider):
         audio_file: Path,
         url: HttpUrl,
         session: aiohttp.ClientSession,
+        debug: bool = False,
     ) -> Tuple[TranscriptionStatus, AzureOutput]:
         """Call the API of the Azure ASR provider."""
         raise NotImplementedError("Azure not implemented.")
@@ -778,6 +926,7 @@ class Deepgram(ASRProvider):
         audio_file: Path,
         url: HttpUrl,
         session: aiohttp.ClientSession,
+        debug: bool = False,
     ) -> Tuple[TranscriptionStatus, DeepgramOutput]:
         """Run the Deepgram ASR provider."""
         headers = {
@@ -786,14 +935,45 @@ class Deepgram(ASRProvider):
         }
 
         _url = f"{url}{build_query_string(self.options)}"
+        try:
+            audio_size = audio_file.stat().st_size
+        except OSError:
+            audio_size = -1
+        _debug_log(
+            debug,
+            self.provider_name,
+            f"POST {_url} | file='{audio_file.name}' "
+            f"size={audio_size} bytes | content_type={headers['Content-Type']} | "
+            f"options={dict(self.options) if hasattr(self.options, 'items') else self.options}",
+        )
+
         async with aiofiles.open(audio_file, mode="rb") as f:
+            _debug_log(
+                debug,
+                self.provider_name,
+                f"Opened audio file '{audio_file.name}'. Sending request "
+                "(this is where the run will appear stuck if the server "
+                "doesn't respond)...",
+            )
             async with session.post(url=_url, data=f, headers=headers) as response:
+                _debug_log(
+                    debug,
+                    self.provider_name,
+                    f"Response received for '{audio_file.name}': "
+                    f"status={response.status}",
+                )
                 if response.status == 200:
                     content = (await response.text()).strip()
                 elif response.status == 504:
                     raise GatewayTimeoutError(response.status)
                 else:
                     raise Exception(await response.text())
+
+        _debug_log(
+            debug,
+            self.provider_name,
+            f"Response body length for '{audio_file.name}': {len(content)} chars",
+        )
 
         if not content:
             status = TranscriptionStatus.FAILED
@@ -804,6 +984,12 @@ class Deepgram(ASRProvider):
             if body.get("err_code"):
                 asr_output = body.get("err_msg")
                 status = TranscriptionStatus.FAILED
+                _debug_log(
+                    debug,
+                    self.provider_name,
+                    f"API returned err_code={body.get('err_code')}: "
+                    f"{body.get('err_msg')}",
+                )
             else:
                 asr_output = DeepgramOutput.from_json(body)
                 status = TranscriptionStatus.COMPLETED
@@ -835,6 +1021,311 @@ class Deepgram(ASRProvider):
         return rttm_lines
 
 
+class SubQ(Deepgram):
+    """ASR provider for the subQ STT API (Deepgram-compatible).
+
+    The SubQ sync endpoint enforces a per-request diarization budget of
+    ~55s of processing time (≈ ~50 minutes of audio at typical RT factors)
+    and is fronted by a proxy that returns 504 on long requests. Files
+    longer than :attr:`_chunk_duration_s` are transparently split into
+    WAV chunks, transcribed sequentially, and stitched back into a single
+    Deepgram-shaped response with global time offsets and per-chunk
+    speaker namespacing.
+    """
+
+    _chunk_duration_s: float = 1500.0
+    _chunk_overlap_s: float = 0.0
+    _chunk_max_retries: int = 3
+
+    def __init__(
+        self,
+        api_url: str,
+        api_key: str,
+        options: dict,
+        concurrency_limit: Union[int, None],
+    ) -> None:
+        super().__init__(api_url, api_key, options, concurrency_limit)
+        self.provider_name = "subq"
+
+    async def get_transcription(
+        self,
+        audio_file: Path,
+        url: HttpUrl,
+        session: aiohttp.ClientSession,
+        debug: bool = False,
+    ) -> Tuple["TranscriptionStatus", DeepgramOutput]:
+        """Run the SubQ ASR provider, chunking long files when necessary."""
+        duration_s = self._read_audio_duration(audio_file)
+
+        if (
+            duration_s is None
+            or duration_s <= self._chunk_duration_s
+            or audio_file.suffix.lower() != ".wav"
+        ):
+            return await super().get_transcription(audio_file, url, session, debug)
+
+        _debug_log(
+            debug,
+            self.provider_name,
+            f"'{audio_file.name}' duration={duration_s:.1f}s exceeds chunk "
+            f"threshold ({self._chunk_duration_s}s); chunking and stitching.",
+        )
+        return await self._transcribe_chunked(
+            audio_file, url, session, duration_s, debug
+        )
+
+    @staticmethod
+    def _read_audio_duration(audio_file: Path) -> Union[float, None]:
+        """Return the audio duration in seconds, or ``None`` if unavailable."""
+        try:
+            import soundfile as sf  # type: ignore[import-untyped]
+
+            info = sf.info(str(audio_file))
+            return float(info.frames) / float(info.samplerate)
+        except Exception:
+            return None
+
+    async def _transcribe_chunked(
+        self,
+        audio_file: Path,
+        url: HttpUrl,
+        session: aiohttp.ClientSession,
+        duration_s: float,
+        debug: bool,
+    ) -> Tuple["TranscriptionStatus", DeepgramOutput]:
+        """Split ``audio_file`` into WAV chunks, transcribe each, and merge."""
+        chunks = await asyncio.to_thread(
+            self._chunk_wav_file, audio_file, self._chunk_duration_s
+        )
+
+        chunk_outputs: List[DeepgramOutput] = []
+        chunk_starts: List[float] = []
+
+        for chunk_idx, (start_s, chunk_bytes) in enumerate(chunks):
+            _debug_log(
+                debug,
+                self.provider_name,
+                f"'{audio_file.name}' chunk {chunk_idx + 1}/{len(chunks)} "
+                f"(start={start_s:.1f}s, bytes={len(chunk_bytes)}); POSTing.",
+            )
+            output = await self._post_chunk_with_retry(
+                chunk_bytes=chunk_bytes,
+                url=url,
+                session=session,
+                debug=debug,
+                audio_name=audio_file.name,
+                chunk_idx=chunk_idx,
+                total_chunks=len(chunks),
+            )
+            chunk_outputs.append(output)
+            chunk_starts.append(start_s)
+
+        merged = self._merge_chunk_outputs(chunk_outputs, chunk_starts, duration_s)
+        return TranscriptionStatus.COMPLETED, merged
+
+    @staticmethod
+    def _chunk_wav_file(
+        audio_file: Path, chunk_duration_s: float
+    ) -> List[Tuple[float, bytes]]:
+        """Read ``audio_file`` and return a list of ``(start_seconds, wav_bytes)``."""
+        import soundfile as sf  # type: ignore[import-untyped]
+
+        chunks: List[Tuple[float, bytes]] = []
+        with sf.SoundFile(str(audio_file)) as src:
+            samplerate = src.samplerate
+            subtype = src.subtype
+            total_frames = src.frames
+            chunk_frames = max(1, int(chunk_duration_s * samplerate))
+
+            offset = 0
+            while offset < total_frames:
+                src.seek(offset)
+                frames = min(chunk_frames, total_frames - offset)
+                data = src.read(frames=frames, dtype="int16", always_2d=True)
+
+                buf = io.BytesIO()
+                with sf.SoundFile(
+                    buf,
+                    mode="w",
+                    samplerate=samplerate,
+                    channels=data.shape[1],
+                    format="WAV",
+                    subtype=subtype if subtype else "PCM_16",
+                ) as dst:
+                    dst.write(data)
+
+                start_s = offset / float(samplerate)
+                chunks.append((start_s, buf.getvalue()))
+                offset += chunk_frames
+
+        return chunks
+
+    async def _post_chunk_with_retry(
+        self,
+        chunk_bytes: bytes,
+        url: HttpUrl,
+        session: aiohttp.ClientSession,
+        debug: bool,
+        audio_name: str,
+        chunk_idx: int,
+        total_chunks: int,
+    ) -> DeepgramOutput:
+        """POST a single WAV chunk and parse the response, retrying on 504."""
+        headers = {
+            "Authorization": f"Token {self.config.api_key.get_secret_value()}",
+            "Content-Type": "audio/wav",
+        }
+        _url = f"{url}{build_query_string(self.options)}"
+
+        last_error: Union[Exception, None] = None
+        for attempt in range(1, self._chunk_max_retries + 1):
+            try:
+                async with session.post(
+                    url=_url, data=chunk_bytes, headers=headers
+                ) as response:
+                    if response.status == 200:
+                        body = json.loads((await response.text()).strip())
+                        return DeepgramOutput.from_json(body)
+                    if response.status == 504:
+                        raise GatewayTimeoutError(response.status)
+                    raise Exception(await response.text())
+            except GatewayTimeoutError as e:
+                last_error = e
+                _debug_log(
+                    debug,
+                    self.provider_name,
+                    f"'{audio_name}' chunk {chunk_idx + 1}/{total_chunks} "
+                    f"504 (attempt {attempt}/{self._chunk_max_retries}); retrying.",
+                )
+                if attempt >= self._chunk_max_retries:
+                    break
+                await asyncio.sleep(min(2 ** (attempt - 1), 8))
+
+        raise last_error if last_error is not None else Exception(
+            f"Failed to POST chunk {chunk_idx + 1}/{total_chunks} for {audio_name}"
+        )
+
+    @staticmethod
+    def _merge_chunk_outputs(
+        chunk_outputs: List[DeepgramOutput],
+        chunk_starts: List[float],
+        total_duration: float,
+    ) -> DeepgramOutput:
+        """Merge per-chunk Deepgram outputs into a single recording-level output.
+
+        Time offsets are added to every word/utterance start/end. Speaker IDs
+        are namespaced per chunk (offset by the running max + 1) because the
+        sync endpoint clusters speakers per-request and there is no acoustic
+        information available here to re-cluster across chunks.
+        """
+        merged_utterances: List[DeepgramUtterance] = []
+        merged_words_by_channel: Dict[int, List[DeepgramWords]] = {}
+        merged_transcript_by_channel: Dict[int, List[str]] = {}
+        merged_confidence_by_channel: Dict[int, List[float]] = {}
+        speaker_offset = 0
+
+        for output, t0 in zip(chunk_outputs, chunk_starts):
+            chunk_max_speaker = -1
+
+            for utt in output.results.utterances or []:
+                new_words = [
+                    SubQ._shift_word(w, t0, speaker_offset) for w in utt.words
+                ]
+                new_utt = utt.model_copy(
+                    update={
+                        "start": utt.start + t0,
+                        "end": utt.end + t0,
+                        "speaker": utt.speaker + speaker_offset,
+                        "words": new_words,
+                    }
+                )
+                merged_utterances.append(new_utt)
+                chunk_max_speaker = max(chunk_max_speaker, utt.speaker)
+                for w in utt.words:
+                    chunk_max_speaker = max(chunk_max_speaker, w.speaker)
+
+            for ch_idx, channel in enumerate(output.results.channels):
+                bucket_words = merged_words_by_channel.setdefault(ch_idx, [])
+                bucket_text = merged_transcript_by_channel.setdefault(ch_idx, [])
+                bucket_conf = merged_confidence_by_channel.setdefault(ch_idx, [])
+                for alt in channel.alternatives:
+                    if alt.transcript:
+                        bucket_text.append(alt.transcript)
+                    bucket_conf.append(alt.confidence)
+                    for w in alt.words:
+                        bucket_words.append(SubQ._shift_word(w, t0, speaker_offset))
+                        chunk_max_speaker = max(chunk_max_speaker, w.speaker)
+
+            speaker_offset += chunk_max_speaker + 1 if chunk_max_speaker >= 0 else 0
+
+        channels = [
+            DeepgramChannel(
+                alternatives=[
+                    DeepgramAlternative(
+                        confidence=(
+                            sum(merged_confidence_by_channel[ch_idx])
+                            / len(merged_confidence_by_channel[ch_idx])
+                            if merged_confidence_by_channel[ch_idx]
+                            else 0.0
+                        ),
+                        transcript=" ".join(
+                            merged_transcript_by_channel.get(ch_idx, [])
+                        ).strip(),
+                        words=merged_words_by_channel.get(ch_idx, []),
+                    )
+                ]
+            )
+            for ch_idx in sorted(merged_words_by_channel.keys())
+        ]
+
+        first = chunk_outputs[0]
+        metadata = first.metadata.model_copy(update={"duration": total_duration})
+
+        return DeepgramOutput(
+            metadata=metadata,
+            results=DeepgramResult(
+                channels=channels,
+                utterances=merged_utterances or None,
+            ),
+        )
+
+    @staticmethod
+    def _shift_word(
+        word: DeepgramWords, t0: float, speaker_offset: int
+    ) -> DeepgramWords:
+        return word.model_copy(
+            update={
+                "start": word.start + t0,
+                "end": word.end + t0,
+                "speaker": word.speaker + speaker_offset,
+            }
+        )
+
+    async def result_to_dialogue(self, asr_output: DeepgramOutput) -> List[str]:
+        """Convert the result to dialogue format for WER."""
+        if asr_output.results.utterances:
+            return await super().result_to_dialogue(asr_output)
+
+        dialogue_lines: List[str] = []
+        for channel in asr_output.results.channels:
+            for alt in channel.alternatives:
+                if alt.transcript:
+                    dialogue_lines.append(alt.transcript)
+        return dialogue_lines
+
+    async def result_to_rttm(self, asr_output: DeepgramOutput) -> List[str]:
+        """Convert the result to RTTM format for DER."""
+        if asr_output.results.utterances:
+            return await super().result_to_rttm(asr_output)
+
+        rttm_lines: List[str] = []
+        for channel in asr_output.results.channels:
+            for alt in channel.alternatives:
+                for word in alt.words:
+                    rttm_lines.append(f"{word.start} {word.end} {word.speaker}")
+        return rttm_lines
+
+
 class Google(ASRProvider):
     """The ASR provider class for Google."""
 
@@ -858,6 +1349,7 @@ class Google(ASRProvider):
         audio_file: Path,
         url: HttpUrl,
         session: aiohttp.ClientSession,
+        debug: bool = False,
     ) -> Tuple[TranscriptionStatus, GoogleOutput]:
         """Run the ASR provider."""
         raise NotImplementedError("Google not implemented.")
@@ -894,6 +1386,7 @@ class RevAI(ASRProvider):
         audio_file: Path,
         url: HttpUrl,
         session: aiohttp.ClientSession,
+        debug: bool = False,
     ) -> Tuple[TranscriptionStatus, RevAIOutput]:
         """Call the API of the RevAI ASR provider."""
         headers = {
@@ -1026,6 +1519,7 @@ class Speechmatics(ASRProvider):
         audio_file: Path,
         url: HttpUrl,
         session: aiohttp.ClientSession,
+        debug: bool = False,
     ) -> Tuple[TranscriptionStatus, SpeechmaticsOutput]:
         """Call the API of the Speechmatics ASR provider."""
         headers = {
@@ -1160,6 +1654,7 @@ class Wordcab(ASRProvider):
         audio_file: Path,
         url: HttpUrl,
         session: aiohttp.ClientSession,
+        debug: bool = False,
     ) -> Tuple[str, TranscriptionStatus, WordcabOutput]:
         """Run the Wordcab ASR provider."""
         headers = {
@@ -1276,6 +1771,7 @@ class WordcabHosted(ASRProvider):
         audio_file: Path,
         url: HttpUrl,
         session: aiohttp.ClientSession,
+        debug: bool = False,
     ) -> Tuple[str, TranscriptionStatus, WordcabHostedOutput]:
         """Run the Wordcab hosted ASR provider."""
         async with aiofiles.open(audio_file, mode="rb") as f:

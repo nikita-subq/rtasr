@@ -32,6 +32,7 @@ dependencies = [
   "rich>=13.5.2",
   "rich-argparse>=1.2.0",
   "seaborn>=0.12.2",
+  "soundfile>=0.12.1",
   "spy-der>=0.4.0",
 ]
 description = "🏆 Run benchmarks against the most common ASR tools on the market."
@@ -40,7 +41,7 @@ keywords = []
 license = "MIT"
 name = "rtasr"
 readme = "README.md"
-requires-python = ">=3.8,<3.12"
+requires-python = ">=3.8,<3.14"
 
 [project.scripts]
 rtasr = "rtasr.__main__:main"

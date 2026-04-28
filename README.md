@@ -129,6 +129,7 @@ Implemented ASR providers are:
 * [ ] `google`: [Google Cloud Speech-to-Text](https://cloud.google.com/speech-to-text)
 * [x] `revai`: [RevAI](https://www.rev.ai/)
 * [x] `speechmatics`: [Speechmatics](https://www.speechmatics.com/)
+* [x] `subq`: [subQ STT API](https://stt-api.staging.aldea.ai)
 * [x] `wordcab`: [Wordcab](https://wordcab.com/)
 
 #### Run transcription

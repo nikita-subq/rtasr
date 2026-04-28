@@ -33,6 +33,7 @@ class ProviderNameDisplay(str, Enum):
     google = "Google"
     revai = "Rev.ai"
     speechmatics = "Speechmatics"
+    subq = "SubQ"
     wordcab = "Wordcab"
     wordcab_hosted = "Wordcab Self-Hosted"
 

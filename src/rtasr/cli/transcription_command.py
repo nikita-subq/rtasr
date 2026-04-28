@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import contextlib
 import importlib
 import json
 import os
@@ -18,6 +19,16 @@ from rtasr.asr import ASRProvider, ProviderResult
 from rtasr.cli_messages import error_message
 from rtasr.constants import DATASETS, PROVIDERS
 from rtasr.utils import create_live_panel, get_api_key, resolve_cache_dir
+
+
+def _dbg(debug: bool, message: str) -> None:
+    """Print a debug message when ``debug`` is enabled.
+
+    Using a single helper keeps the call sites short and ensures every debug
+    line is consistently tagged so it is easy to grep in a long log.
+    """
+    if debug:
+        print(rf"[bold magenta]\[DEBUG][/bold magenta] [cli] {message}")
 
 
 def transcription_asr_command_factory(args: argparse.Namespace):
@@ -178,6 +189,15 @@ class TranscriptionASRCommand:
 
         """
         try:
+            _dbg(
+                self.debug,
+                f"Starting transcription run with args: providers={self.providers}, "
+                f"local_file={self.local_file}, dataset={self.dataset}, "
+                f"split={self.split}, output_dir={self.output_dir}, "
+                f"data_range={self.data_range}, dataset_dir={self.dataset_dir}, "
+                f"use_cache={self.use_cache}, host={self.host}, port={self.port}",
+            )
+
             for provider in self.providers:
                 if provider.lower() not in PROVIDERS.keys():
                     print(
@@ -185,6 +205,7 @@ class TranscriptionASRCommand:
                     )
                     print("".join([f"  - [bold]{p}[bold]\n" for p in PROVIDERS.keys()]))
                     exit(1)
+            _dbg(self.debug, "Provider validation passed.")
 
             if "wordcab-hosted" in self.providers:
                 if self.host is None or self.port is None:
@@ -249,6 +270,11 @@ class TranscriptionASRCommand:
                 rf"Dataset [bold green]\[{_dataset}][/bold green] from"
                 f" {dataset_dir.resolve()}"
             )
+            _dbg(
+                self.debug,
+                f"Resolved dataset_dir={dataset_dir.resolve()} (exists="
+                f"{dataset_dir.exists()})",
+            )
 
             splits: List[str] = []
             if self.split.lower() == "all":
@@ -270,6 +296,7 @@ class TranscriptionASRCommand:
                 exit(1)
 
             print(f"Using splits: {splits}")
+            _dbg(self.debug, f"Resolved splits={splits}")
 
             if _dataset == "local":
                 if local_file.is_dir():
@@ -327,6 +354,14 @@ class TranscriptionASRCommand:
                     f"Manifest filepaths: {len(selected_manifest_filepaths)} files"
                     " found."
                 )
+                _dbg(
+                    self.debug,
+                    "Manifest filepaths: "
+                    + ", ".join(
+                        f"{split}={p.resolve()}"
+                        for split, p in selected_manifest_filepaths
+                    ),
+                )
 
                 audio_filepaths: Dict[str, List[Path]] = {s: [] for s in splits}
                 for split, manifest_filepath in selected_manifest_filepaths:
@@ -335,6 +370,11 @@ class TranscriptionASRCommand:
 
                     audio_filepaths[split].extend(
                         [Path(m["audio_filepath"]) for m in manifest]
+                    )
+                    _dbg(
+                        self.debug,
+                        f"Loaded manifest for split={split}: "
+                        f"{len(audio_filepaths[split])} entries",
                     )
 
             verified_audio_filepaths: Dict[str, List[Path]] = {s: [] for s in splits}
@@ -350,6 +390,22 @@ class TranscriptionASRCommand:
                     f" green]{len(verified_audio_filepaths[split])}[/bold"
                     f" green]/{len(audio_filepaths[split])} (found/total)"
                 )
+                if self.debug:
+                    missing = [
+                        str(p) for p in filepaths if not p.exists()
+                    ]
+                    if missing:
+                        _dbg(
+                            self.debug,
+                            f"[{split}] {len(missing)} missing audio file(s); "
+                            f"first 3: {missing[:3]}",
+                        )
+                    if verified_audio_filepaths[split]:
+                        _dbg(
+                            self.debug,
+                            f"[{split}] First verified audio file: "
+                            f"{verified_audio_filepaths[split][0]}",
+                        )
 
             if self.output_dir is None:
                 output_dir = resolve_cache_dir() / "transcription"
@@ -359,6 +415,10 @@ class TranscriptionASRCommand:
             transcription_dir = output_dir / _dataset
             if not transcription_dir.exists():
                 transcription_dir.mkdir(parents=True, exist_ok=True)
+            _dbg(
+                self.debug,
+                f"Transcription output dir: {transcription_dir.resolve()}",
+            )
 
             engines: List[ASRProvider] = []
             for _provider in _providers:
@@ -368,6 +428,14 @@ class TranscriptionASRCommand:
                 )
 
                 _api_key: Union[str, None] = get_api_key(_provider)
+                _dbg(
+                    self.debug,
+                    f"Provider {_provider}: engine_class={engine_class.__name__}, "
+                    f"api_url={PROVIDERS[_provider].get('url', None)}, "
+                    f"api_key_present={_api_key is not None}, "
+                    f"concurrency_limit={PROVIDERS[_provider].get('concurrency_limit', None)}, "
+                    f"options={PROVIDERS[_provider].get('options', {})}",
+                )
                 if _api_key is not None or _provider == "wordcab-hosted":
                     kwargs = {
                         "api_url": PROVIDERS[_provider].get("url", None),
@@ -382,6 +450,18 @@ class TranscriptionASRCommand:
                         kwargs["port"] = self.port
 
                     engines.append(engine_class(**kwargs))
+                else:
+                    _dbg(
+                        self.debug,
+                        f"Skipped provider {_provider}: no API key found in env. "
+                        "Engine will not be created.",
+                    )
+
+            _dbg(
+                self.debug,
+                f"Created {len(engines)} engine(s): "
+                f"{[type(e).__name__ for e in engines]}",
+            )
 
             (
                 current_progress,
@@ -390,9 +470,31 @@ class TranscriptionASRCommand:
                 progress_group,
             ) = create_live_panel()
 
-            with Live(progress_group):
+            # In debug mode, skip the rich Live display so that debug prints and
+            # tracebacks are not hidden behind the progress bars. The progress
+            # objects are still used by the providers, they just don't render.
+            live_ctx = (
+                contextlib.nullcontext()
+                if self.debug
+                else Live(progress_group)
+            )
+            if self.debug:
+                _dbg(
+                    self.debug,
+                    "Debug mode is ON. Skipping rich Live progress display so "
+                    "debug logs and tracebacks are visible.",
+                )
+
+            with live_ctx:
                 current_progress_task_id = current_progress.add_task(
                     f"Running transcription over the `{_dataset}` dataset"
+                )
+                _dbg(
+                    self.debug,
+                    f"About to call asyncio.run(_run) with "
+                    f"{len(engines)} engine(s) and "
+                    f"{sum(len(v) for v in verified_audio_filepaths.values())} "
+                    "audio file(s) (before debug-mode slicing).",
                 )
                 results = asyncio.run(
                     self._run(
@@ -405,6 +507,10 @@ class TranscriptionASRCommand:
                         self.use_cache,
                         self.debug,
                     )
+                )
+                _dbg(
+                    self.debug,
+                    f"asyncio.run(_run) returned {len(results)} result(s).",
                 )
 
                 current_progress.stop_task(current_progress_task_id)
